@@ -17,5 +17,16 @@
             "SensorAngEular":[0,0,0],// 视觉传感器的安装姿态，用欧拉角方式表示，单位角度制
             "otherParams":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0] //Type1(RGB): otherParams无专用参数
         }
+    ],
+    "dataset":[
+        {
+            // 数据集保存配置（供 test_dateset.py 读取；VisionSensors 部分不受影响）
+            // 优先级：命令行 --save-dir > 环境变量 SO3_DATASET_ROOT > 本文件 > 脚本内 DATASET_ROOT 常量
+            // 注意：本文件用 // 和 # 作注释，路径里请不要出现 "//"，否则会被当成注释截断
+            "SaveDir":"D:/yolo-tod/datasets", //数据集保存的根目录：留空""表示脚本所在目录；可填绝对路径如"D:/datasets/SO3"，也可填相对脚本目录的相对路径如"dataset_out"
+            "UseTimestampSubdir":false, //是否在根目录下再建一层时间戳子目录(年月日_时分秒)：true=多次运行互不覆盖，false=始终写入同一个images/labels目录
+            "ImageSubdir":"images", //图像子目录名（YOLO标准布局）
+            "LabelSubdir":"labels" //YOLO标签子目录名
+        }
     ]
 }

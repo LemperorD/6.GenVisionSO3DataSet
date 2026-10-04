@@ -1,6 +1,9 @@
 # import required libraries
 import random
 import os
+import re
+import json
+import argparse
 from turtle import shape
 import cv2
 import time
@@ -11,8 +14,8 @@ import numpy as np
 
 import VisionCaptureApi
 import UE4CtrlAPI
-ue = UE4CtrlAPI.UE4CtrlAPI()
 
+ue = UE4CtrlAPI.UE4CtrlAPI()
 vis = VisionCaptureApi.VisionCaptureApi()
 
 ue.sendUE4Cmd('RflyChangeMapbyName Grasslands')
@@ -47,7 +50,7 @@ time.sleep(1)
 # the checkerboard is located to 1m before the vehicle, with yaw angle 90 degree (face the vhicle)
 InitTargePos = [1.03, 0, -8.086-4]
 InitTargeAng = [0, 0, math.pi/2]
-ue.sendUE4Pos(100, 3, 0, InitTargePos, InitTargeAng)
+ue.sendUE4Pos(100, 1, 0, InitTargePos, InitTargeAng)
 # 相机标定后的内参矩阵
 intrMatrix = np.matrix([[320, 0, 0],
                         [0, 320, 0],
@@ -293,16 +296,188 @@ def text_create(name, msg):
     file.close()
 
 
+# ==================== 数据集保存位置配置（本实验专用） ====================
+# 数据集根目录，支持四种配置方式（优先级从高到低）：
+#   1) 命令行参数： python test_dateset.py --save-dir "D:/datasets/SO3"
+#   2) 环境变量：   set SO3_DATASET_ROOT=D:\datasets\SO3          (Windows CMD)
+#                   $env:SO3_DATASET_ROOT="D:\datasets\SO3"      (PowerShell)
+#   3) Config.json 中的 dataset 段（推荐，见 Config.json 内的注释）
+#   4) 直接修改下面的默认值
+# 取值说明：
+#   ''         -> 使用脚本所在目录（与原脚本行为一致）
+#   绝对路径   -> 直接按该路径保存
+#   相对路径   -> 相对“脚本所在目录”解析
+# 注意：Config.json 用 // 和 # 作注释，因此其中的路径不要包含 "//"（会被当作注释截断）
+DATASET_ROOT = ''
+# 是否在根目录下再套一层时间戳子目录（%Y%m%d_%H%M%S）：
+#   True  -> <DATASET_ROOT>/20240101_120000/{images,labels}，多次运行互不覆盖
+#   False -> <DATASET_ROOT>/{images,labels}，多次运行写入同一目录
+USE_TIMESTAMP_SUBDIR = True
+# 图/标签子目录名（标准 YOLO 布局为 images/labels，可按需改名）
+IMAGE_SUBDIR = 'images'
+LABEL_SUBDIR = 'labels'
+# 配置文件（与 VisionCaptureApi.jsonLoad 使用的是同一个文件），可用 --config 指定其他文件
+CONFIG_FILE = 'Config.json'
+# ========================================================================
+
+
+def parse_args():
+    '''
+    解析命令行参数；用 parse_known_args 兼容 RflySim 等外部调用时附带的额外参数
+    '''
+    parser = argparse.ArgumentParser(
+        description='生成 SO3 视觉数据集（保存位置可配置）')
+    parser.add_argument('--save-dir', '--save_dir', dest='save_dir', default=None,
+                        help='数据集保存根目录，优先于环境变量 SO3_DATASET_ROOT、Config.json 和 DATASET_ROOT')
+    parser.add_argument('--config', dest='config', default=None,
+                        help='配置文件路径（默认脚本目录下的 Config.json），其中的 dataset 段用于配置保存位置')
+    parser.add_argument('--timestamp', dest='timestamp', action='store_true',
+                        default=None, help='在根目录下创建时间戳子目录（默认行为）')
+    parser.add_argument('--no-timestamp', '--no_timestamp', dest='timestamp',
+                        action='store_false', default=None,
+                        help='不创建时间戳子目录，直接写入 <根目录>/images 与 <根目录>/labels')
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print('[提示] 已忽略无法识别的命令行参数: {}'.format(unknown))
+    return args
+
+
+def load_dataset_config(config_path):
+    '''
+    读取 Config.json 中的 dataset 配置段。
+    解析方式与 VisionCaptureApi.jsonLoad 保持一致：先过滤 // 与 # 注释，再交给 json 解析。
+    读取或解析失败时返回空 dict，不影响脚本主流程。
+    '''
+    if not config_path or not os.path.isfile(config_path):
+        print('[配置] 未找到 {}，跳过其中的 dataset 配置'.format(config_path))
+        return {}
+    try:
+        lines = []
+        with open(config_path, 'r', encoding='utf-8') as f:
+            for row in f.readlines():
+                if row.strip().startswith('//') or row.strip().startswith('#'):
+                    continue
+                row = re.sub('//.*', '', row)   # 去掉 // 注释
+                row = re.sub('#.*', '', row)    # 去掉 # 注释
+                lines.append(row)
+        js_data = json.loads('\n'.join(lines))
+    except Exception as err:
+        print('[警告] 解析 {} 失败({})，将忽略其中的 dataset 配置'.format(config_path, err))
+        return {}
+    if not isinstance(js_data, dict):
+        print('[警告] {} 的顶层不是 JSON 对象，将忽略其中的 dataset 配置'.format(config_path))
+        return {}
+    ds = js_data.get('dataset', {})
+    if isinstance(ds, list):        # 兼容 "dataset":[ {...}, {...} ] 的写法，后面的覆盖前面的
+        merged = {}
+        for item in ds:
+            if isinstance(item, dict):
+                merged.update(item)
+        ds = merged
+    if not isinstance(ds, dict):
+        print('[警告] Config.json 的 dataset 段应为对象或对象数组，当前为 {}，已忽略'.format(
+            type(ds).__name__))
+        return {}
+    # 键名统一为小写并去掉 _ - 空格，从而容忍 SaveDir / save_dir / save-dir 等写法
+    return {re.sub(r'[_\-\s]', '', str(k)).lower(): v for k, v in ds.items()}
+
+
+def cfg_get_str(cfg, *names):
+    '''
+    从（已归一化键名的）dataset 配置中取第一个非空字符串
+    '''
+    for name in names:
+        value = cfg.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def cfg_get_bool(cfg, *names):
+    '''
+    从（已归一化键名的）dataset 配置中取布尔值，兼容 true/false、1/0、"true"/"false"
+    '''
+    for name in names:
+        value = cfg.get(name)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ('true', '1', 'yes', 'y', 'on'):
+                return True
+            if text in ('false', '0', 'no', 'n', 'off'):
+                return False
+    return None
+
+
+def pick_first(*candidates):
+    '''
+    按顺序返回第一个非空的候选值，返回 (来源说明, 取值)
+    '''
+    for source, value in candidates:
+        if value is not None and value != '':
+            return source, value
+    return candidates[-1]
+
+
+def resolve_save_root(cli_save_dir, env_save_dir, cfg_save_dir, script_dir):
+    '''
+    按 命令行 > 环境变量 > Config.json > 脚本内常量 的优先级确定数据集根目录，
+    并把相对路径统一解析为绝对路径
+    '''
+    source, root = pick_first(
+        ('命令行参数 --save-dir', cli_save_dir),
+        ('环境变量 SO3_DATASET_ROOT', env_save_dir),
+        ('Config.json 的 dataset.SaveDir', cfg_save_dir),
+        ('脚本内 DATASET_ROOT', DATASET_ROOT),
+        ('脚本所在目录（默认）', script_dir))
+    # 展开 ~ 与 %VAR% / $VAR% 形式的环境变量
+    root = os.path.expanduser(os.path.expandvars(root))
+    if not os.path.isabs(root):
+        root = os.path.join(script_dir, root)   # 相对路径按脚本所在目录解析
+    print('[配置] 数据集保存根目录来源: {}'.format(source))
+    return os.path.normpath(root)
+
+
 # 以当前日期和时间创建文件夹，准备写入新图片
-path_prefix = sys.path[0]    # 当前工作路径
-path_dir = os.path.join(
-    path_prefix, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-os.makedirs(path_dir)
+path_prefix = sys.path[0] or os.path.dirname(os.path.abspath(__file__))  # 脚本所在路径
+_args = parse_args()
+
+# 1) 读取 Config.json（其中的 dataset 段用于配置保存位置）
+config_path = _args.config or CONFIG_FILE
+if not os.path.isabs(config_path):
+    config_path = os.path.join(path_prefix, config_path)   # 相对路径按脚本所在目录解析
+config_path = os.path.normpath(config_path)
+_dataset_cfg = load_dataset_config(config_path)
+
+# 2) 保存根目录：命令行 > 环境变量 > Config.json > 脚本内常量 > 脚本目录
+save_root = resolve_save_root(_args.save_dir, os.environ.get('SO3_DATASET_ROOT'),
+                              cfg_get_str(_dataset_cfg, 'savedir', 'savepath',
+                                          'datasetroot', 'savedirpath'),
+                              path_prefix)
+
+# 3) 是否套一层时间戳子目录：命令行 > Config.json > 脚本内常量
+_cfg_timestamp = cfg_get_bool(_dataset_cfg, 'usetimestampsubdir', 'usetimestamp', 'timestamp')
+use_timestamp = _args.timestamp if _args.timestamp is not None else (
+    _cfg_timestamp if _cfg_timestamp is not None else USE_TIMESTAMP_SUBDIR)
+
+# 4) 图/标签子目录名：Config.json > 脚本内常量
+image_subdir = cfg_get_str(_dataset_cfg, 'imagesubdir', 'imgsubdir', 'imagesdir') or IMAGE_SUBDIR
+label_subdir = cfg_get_str(_dataset_cfg, 'labelsubdir', 'labsubdir', 'labelsdir') or LABEL_SUBDIR
+
+path_dir = os.path.join(save_root, datetime.datetime.now().strftime("%Y%m%d_%H%M%S")) \
+    if use_timestamp else save_root
+os.makedirs(path_dir, exist_ok=True)
+print("config.json: {}".format(config_path))
+print("save_root: {}".format(save_root))
 print("path_dir: {}".format(path_dir))
-path_img = os.path.join(path_dir, "images")
-labels = os.path.join(path_dir, "labels")
-os.makedirs(path_img)
-os.makedirs(labels)
+print("use_timestamp: {}".format(use_timestamp))
+path_img = os.path.join(path_dir, image_subdir)
+labels = os.path.join(path_dir, label_subdir)
+os.makedirs(path_img, exist_ok=True)
+os.makedirs(labels, exist_ok=True)
 
 
 print(path_img)
@@ -338,7 +513,7 @@ while True:
         # TargePos = [2,1,-8.086-4.8]
         # TargeAng = [0,-np.pi/6,0]
 
-        ue.sendUE4Pos(100, 3, 0, TargePos, TargeAng, -1)
+        ue.sendUE4Pos(100, 1, 0, TargePos, TargeAng, -1)
         points = getUav9Point(TargePos, copterCenterHeight, TargeAng)
         time.sleep(0.2)
         i = 0
